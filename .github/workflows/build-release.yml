@@ -1,0 +1,117 @@
+name: Build & Publish Release APK
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Diperlukan untuk membuat Release dan mengunggah aset APK
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release APK (Gradle)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Gradle (with caching)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Extract app version
+        id: version
+        run: |
+          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle)
+          VERSION_CODE=$(grep -oP 'versionCode\s*=\s*\K\d+' app/build.gradle)
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "Detected version: v${VERSION_NAME} (versionCode ${VERSION_CODE})"
+
+      - name: Generate CI signing keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore ci-signing.keystore \
+            -storetype PKCS12 \
+            -storepass usbgadgetci \
+            -keypass usbgadgetci \
+            -alias usbgadget \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=USB Gadget Tool CI, OU=CI, O=MitsuhaMone, C=ID"
+
+      - name: Zipalign & sign APK
+        run: |
+          UNSIGNED_APK=$(ls app/build/outputs/apk/release/*.apk)
+          echo "Unsigned APK : $UNSIGNED_APK"
+          BT_DIR=$(dirname "$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)")
+          echo "Build-tools  : $BT_DIR"
+          ALIGNED_APK="app/build/outputs/apk/release/aligned.apk"
+          SIGNED_APK="app/build/outputs/apk/release/USBGadgetTool-v${{ steps.version.outputs.version_name }}-release.apk"
+          "$BT_DIR/zipalign" -f -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+          "$BT_DIR/apksigner" sign \
+            --ks ci-signing.keystore \
+            --ks-pass pass:usbgadgetci \
+            --key-pass pass:usbgadgetci \
+            --out "$SIGNED_APK" \
+            "$ALIGNED_APK"
+          "$BT_DIR/apksigner" verify --print-certs "$SIGNED_APK"
+          "$BT_DIR/zipalign" -c -p 4 "$SIGNED_APK"
+          echo "APK_PATH=$SIGNED_APK" >> "$GITHUB_ENV"
+          sha256sum "$SIGNED_APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: ${{ env.APK_PATH }}
+
+      - name: Create GitHub Release & upload APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION_NAME="${{ steps.version.outputs.version_name }}"
+          VERSION_CODE="${{ steps.version.outputs.version_code }}"
+          TAG="v${VERSION_NAME}-r${GITHUB_RUN_NUMBER}"
+          SHA256=$(sha256sum "$APK_PATH" | awk '{print $1}')
+          NOTES=$(cat <<EOF
+          ### USB Gadget Tool v${VERSION_NAME} — CI build #${GITHUB_RUN_NUMBER}
+
+          APK ini dibangun otomatis oleh GitHub Actions dari branch master
+          (commit ${GITHUB_SHA}).
+
+          **Info build**
+          - Versi aplikasi : v${VERSION_NAME} (versionCode ${VERSION_CODE})
+          - Application ID : net.tjado.usbgadget
+          - Min Android 6.0 (API 23) / targetSdk 36 / compileSdk 37
+          - Gradle 9.8.2, Android Gradle Plugin 9.5.0, JDK 21 (ubuntu-latest)
+
+          **Syarat pemakaian**: perangkat **root** + kernel dengan dukungan
+          **ConfigFS**.
+
+          **Catatan tanda tangan**: APK ini ditandatangani dengan keystore yang
+          dibuat otomatis oleh CI, bukan kunci resmi developer (tejado)/F-Droid.
+          Signature berbeda dan application ID sama, jadi jika sebelumnya
+          menginstal versi dari F-Droid, uninstall dulu versi lama sebelum
+          memasang APK ini.
+
+          SHA-256: ${SHA256}
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK_PATH" --clobber
+          else
+            gh release create "$TAG" "$APK_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "USB Gadget Tool v${VERSION_NAME} (CI build #${GITHUB_RUN_NUMBER})" \
+              --notes "$NOTES"
+          fi
